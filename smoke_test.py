@@ -4,6 +4,7 @@ Run with:  .venv/bin/python smoke_test.py
 Exits non-zero on any failure.
 """
 
+import os
 import sys
 
 import server
@@ -62,9 +63,10 @@ check("float division (no silent integer truncation)", 0 < r < 1, str(r))
 
 r = server.run_query("SELECT * FROM customers")
 check(
-    "oversized result refused up front (no partial dump)",
-    r.get("result_too_large") and r["rows"] == [] and r["total_rows"] == 7043,
-    f"reported {r.get('total_rows')} rows / ~{r.get('estimated_kb')} KB without shipping them",
+    "oversized result auto-delivered as complete CSV file",
+    r.get("delivered_as_file") and r["total_rows"] == 7043
+    and os.path.exists(r["path"]) and len(r["preview_rows"]) == 5,
+    f"{r.get('total_rows')} rows -> {os.path.basename(r.get('path', ''))} ({r.get('size_kb')} KB)",
 )
 r = server.run_query('SELECT "Customer ID" FROM customers LIMIT 1500')
 check(
@@ -72,7 +74,6 @@ check(
     r["row_count"] == 1500 and not r.get("result_too_large"),
     f"{r['row_count']} rows",
 )
-import os
 
 os.environ["CHURN_MCP_MAX_KB"] = "0"  # owner disables the budget -> unlimited
 r = server.run_query("SELECT * FROM customers")

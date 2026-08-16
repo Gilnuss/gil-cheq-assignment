@@ -95,19 +95,14 @@ it**, in the parser and the engine, never in a prompt.
    statement per call, type must be SELECT; PRAGMA and CALL are rejected explicitly.
 3. **Compute layer** — even a small table lets SQL manufacture unbounded work (a 3-way cross
    join of 7K rows is 3.5×10¹¹ combinations; a recursive CTE can run forever). A watchdog
-   cancels any query past the timeout (default 10s, `CHURN_MCP_TIMEOUT_S`, 0 = off), and the
+   cancels any query past the timeout (default 30s, `CHURN_MCP_TIMEOUT_S`, 0 = off), and the
    engine's memory is capped at 1 GB — set before the configuration lock, so no query can
    raise it.
-4. **Output layer (cost guardrail, owner-configurable)** — everything returned lands in the
-   client LLM's context window, which you pay for per token. Responses are budgeted by
-   **size** (default ~50 KB ≈ 12k tokens), and an oversized result is **refused up front,
-   never shipped partially**: the client gets the total row count and size for a few hundred
-   bytes and decides itself — aggregate, select fewer columns, or paginate with
-   `LIMIT/OFFSET` (full data always reachable, no tokens wasted on a partial dump). The
-   budget is **policy, not a limit of the tool** — set `CHURN_MCP_MAX_KB` to raise it, or
-   `0` to disable it entirely. And bulk raw data has its own channel: `export_result`
-   writes complete results to CSV at any size, so no question and no dataset size is ever
-   out of reach.
+4. **Response routing** — like email: text inline, attachments as files. Small results are
+   returned in the chat; a result too large for a chat response (default threshold ~50 KB,
+   `CHURN_MCP_MAX_KB`, 0 = always inline) is **automatically saved as a complete CSV** and
+   the response carries the file path, total rows, and a preview. Nothing is ever refused,
+   trimmed, or lost — big results just arrive by file, the channel built for them.
 
 `smoke_test.py` runs a 15-attack suite against these layers (multi-statement injection,
 `COPY TO` exfiltration, reading `/etc/passwd`, re-enabling external access, extension installs,

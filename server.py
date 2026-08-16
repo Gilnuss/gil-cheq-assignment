@@ -14,7 +14,9 @@ server's job is to make that loop accurate and safe:
 
 from __future__ import annotations
 
+import csv
 import os
+import re
 import threading
 import time
 from typing import Any
@@ -138,8 +140,8 @@ _ALLOWED_STATEMENT_TYPES = {duckdb.StatementType.SELECT}
 # Compute guardrail: SQL can manufacture unbounded WORK even on a small table
 # (a 3-way cross join of 7K rows = 3.5e11 combinations; a recursive CTE can run
 # forever). A watchdog interrupts any query that exceeds the timeout. Owner's
-# policy, like the size budget: CHURN_MCP_TIMEOUT_S (default 10, 0 = off).
-DEFAULT_TIMEOUT_S = 10
+# policy, like the size budget: CHURN_MCP_TIMEOUT_S (default 30, 0 = off).
+DEFAULT_TIMEOUT_S = 30
 
 
 def _query_timeout_s() -> float:
@@ -165,6 +167,27 @@ def _execute_guarded(sql: str) -> duckdb.DuckDBPyConnection:
         return CON.execute(sql)
     finally:
         watchdog.cancel()
+
+
+def _new_export_path(filename: str) -> str:
+    """A fresh .csv path inside exports/ — name sanitized so it can't escape."""
+    safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", filename).strip("_") or "export"
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    path = os.path.join(EXPORT_DIR, f"{safe_name}.csv")
+    counter = 1
+    while os.path.exists(path):
+        counter += 1
+        path = os.path.join(EXPORT_DIR, f"{safe_name}_{counter}.csv")
+    return path
+
+
+def _write_csv(column_names: list[str], rows: list[tuple], filename: str) -> str:
+    path = _new_export_path(filename)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(column_names)
+        writer.writerows(rows)
+    return path
 
 
 def _validate_select(sql: str) -> str | None:
@@ -247,12 +270,11 @@ def run_query(sql: str) -> dict[str, Any]:
     """Run a read-only SQL query against the `customers` table and return the
     results along with the SQL that was executed (so the answer is auditable).
 
-    Rules: exactly one statement; SELECT (or WITH ... SELECT) only. Results are
-    budgeted by size (default ~50 KB, owner-configurable via CHURN_MCP_MAX_KB)
-    to protect the user's context-window cost. An oversized result is refused
-    up front with its size and row count (no partial dump, no tokens wasted) —
-    then choose: aggregate, select fewer columns, or paginate via LIMIT/OFFSET.
-    Call get_schema first to see real column names and categorical values.
+    Rules: exactly one statement; SELECT (or WITH ... SELECT) only. Small
+    results are returned inline; results too large for a chat response
+    (default ~50 KB, owner-configurable via CHURN_MCP_MAX_KB) are delivered
+    complete as a CSV file instead — you get the path, total rows, and a
+    preview. Call get_schema first to see real column names and values.
     """
     start = time.perf_counter()
 
@@ -285,30 +307,28 @@ def run_query(sql: str) -> dict[str, Any]:
     duration_ms = (time.perf_counter() - start) * 1000
     payload_chars = sum(len(str(row)) for row in fetched)
 
-    # Cost guardrail: an oversized result is REFUSED UP FRONT with metadata,
-    # never shipped partially. A trimmed dump would cost the full budget in
-    # client tokens and still be useless (incomplete), forcing a paid retry.
-    # Instead the client learns the size for a few hundred bytes and decides
-    # itself: aggregate, paginate, or have the owner raise the budget.
+    # Response routing: small results travel inline in the chat; results too
+    # big for a chat response are AUTOMATICALLY delivered as a complete CSV
+    # file instead — like an email attachment. Nothing is refused or trimmed;
+    # the client gets the file path plus a small preview.
     if payload_chars > _payload_budget_chars():
-        _log("run_query", sql, "oversize", f"{len(fetched)} rows, ~{payload_chars // 1000} KB",
-             rows=0, duration_ms=duration_ms)
+        path = _write_csv(column_names, fetched, "query_result")
+        _log("run_query", sql, "routed_to_file",
+             f"{len(fetched)} rows, ~{payload_chars // 1000} KB -> {os.path.basename(path)}",
+             rows=len(fetched), duration_ms=duration_ms)
         return {
             "sql": sql,
             "columns": column_names,
-            "rows": [],
-            "row_count": 0,
-            "result_too_large": True,
+            "delivered_as_file": True,
+            "path": path,
             "total_rows": len(fetched),
-            "estimated_kb": payload_chars // 1000,
-            "guidance": "The full result was computed but not returned: it would cost "
-            f"~{payload_chars // 1000} KB of the user's context window (budget: "
-            f"{os.environ.get('CHURN_MCP_MAX_KB', DEFAULT_MAX_KB)} KB). Decide what the "
-            "question actually needs: if the user wants insight, aggregate (GROUP BY / "
-            "COUNT / AVG) or SELECT fewer columns; if the user wants the raw data itself, "
-            "call export_result with this same SQL — it writes the complete result to a "
-            "CSV at any size with zero context cost. The owner can also raise or disable "
-            "the budget via CHURN_MCP_MAX_KB (0 = unlimited).",
+            "size_kb": os.path.getsize(path) // 1000,
+            "preview_rows": fetched[:5],
+            "note": "Result too large for an inline chat response, so the COMPLETE "
+            "result was saved to the CSV at 'path' — give the user that path. If they "
+            "wanted an insight rather than raw rows, consider an aggregated query "
+            "instead. (Inline threshold is owner-configurable: CHURN_MCP_MAX_KB, "
+            "0 = always inline.)",
         }
 
     _log("run_query", sql, "ok", rows=len(fetched), duration_ms=duration_ms)
@@ -379,9 +399,6 @@ def export_result(sql: str, filename: str = "export") -> dict[str, Any]:
     inspection) instead of paging rows through run_query. Same rules as
     run_query: exactly one SELECT statement.
     """
-    import csv
-    import re
-
     start = time.perf_counter()
 
     rejection = _validate_select(sql)
@@ -389,15 +406,7 @@ def export_result(sql: str, filename: str = "export") -> dict[str, Any]:
         _log("export_result", sql, "blocked", rejection)
         return {"error": rejection}
 
-    # Exports go ONLY into exports/ next to the server; sanitize the name so a
-    # path can't escape it.
-    safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", filename).strip("_") or "export"
-    os.makedirs(EXPORT_DIR, exist_ok=True)
-    path = os.path.join(EXPORT_DIR, f"{safe_name}.csv")
-    counter = 1
-    while os.path.exists(path):
-        counter += 1
-        path = os.path.join(EXPORT_DIR, f"{safe_name}_{counter}.csv")
+    path = _new_export_path(filename)
 
     try:
         cursor = _execute_guarded(sql)
