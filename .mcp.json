@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "churn-analytics": {
+      "command": ".venv/bin/python",
+      "args": ["server.py"]
+    }
+  }
+}
