@@ -90,11 +90,12 @@ it**, in the parser and the engine, never in a prompt.
    statement per call, type must be SELECT; PRAGMA and CALL are rejected explicitly.
 3. **Output layer (cost guardrail, owner-configurable)** — everything returned lands in the
    client LLM's context window, which you pay for per token. Responses are budgeted by
-   **size** (default ~50 KB ≈ 12k tokens) rather than an arbitrary row count: narrow results
-   keep thousands of rows, wide dumps get trimmed with an explicit warning suggesting
-   aggregation or `LIMIT/OFFSET` pagination (full data always reachable). The budget is
-   **policy, not a limit of the tool** — set `CHURN_MCP_MAX_KB` to raise it, or `0` to
-   disable it entirely.
+   **size** (default ~50 KB ≈ 12k tokens), and an oversized result is **refused up front,
+   never shipped partially**: the client gets the total row count and size for a few hundred
+   bytes and decides itself — aggregate, select fewer columns, or paginate with
+   `LIMIT/OFFSET` (full data always reachable, no tokens wasted on a partial dump). The
+   budget is **policy, not a limit of the tool** — set `CHURN_MCP_MAX_KB` to raise it, or
+   `0` to disable it entirely.
 
 `smoke_test.py` runs a 15-attack suite against these layers (multi-statement injection,
 `COPY TO` exfiltration, reading `/etc/passwd`, re-enabling external access, extension installs,

@@ -25,7 +25,7 @@ All controls sit below the model, never in a prompt:
 
 1. **Engine** — external access off and configuration locked; data served from an in-memory copy.
 2. **Query** — DuckDB's own parser gates every call: one statement, SELECT only.
-3. **Output (cost)** — responses budgeted by size (default ~50 KB): results land in the user's paid context window. Policy, not a limit: owner-configurable (`CHURN_MCP_MAX_KB`, 0 = off), and full data stays reachable via pagination.
+3. **Output (cost)** — responses budgeted by size (default ~50 KB): results land in the user's paid context window. Oversized results are refused up front with row count + size — never shipped partially — so the LLM decides (aggregate / fewer columns / paginate) without paying for a wasted dump. Policy, not a limit: owner-configurable (`CHURN_MCP_MAX_KB`, 0 = off).
 4. **Audit** — every call logged to a DuckDB table the LLM-facing connection cannot reach.
 
 A committed `smoke_test.py` proves it: 15 attacks (injection, exfiltration, config re-enable…) — 15/15 blocked — plus ground-truth checks (26.54% churn).

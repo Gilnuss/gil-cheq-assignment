@@ -61,16 +61,15 @@ r = server.run_query("SELECT 385/7043")["rows"][0][0]
 check("float division (no silent integer truncation)", 0 < r < 1, str(r))
 
 r = server.run_query("SELECT * FROM customers")
-payload = len(str(r["rows"]))
 check(
-    "default payload budget trims wide dump",
-    r["truncated"] and payload <= server.DEFAULT_MAX_KB * 1000 * 1.1,
-    f"{r['row_count']} rows, ~{payload // 1000} KB",
+    "oversized result refused up front (no partial dump)",
+    r.get("result_too_large") and r["rows"] == [] and r["total_rows"] == 7043,
+    f"reported {r.get('total_rows')} rows / ~{r.get('estimated_kb')} KB without shipping them",
 )
 r = server.run_query('SELECT "Customer ID" FROM customers LIMIT 1500')
 check(
     "narrow queries keep many rows within budget",
-    r["row_count"] == 1500 and not r["truncated"],
+    r["row_count"] == 1500 and not r.get("result_too_large"),
     f"{r['row_count']} rows",
 )
 import os
@@ -79,7 +78,7 @@ os.environ["CHURN_MCP_MAX_KB"] = "0"  # owner disables the budget -> unlimited
 r = server.run_query("SELECT * FROM customers")
 check(
     "budget disabled returns every row",
-    r["row_count"] == 7043 and not r["truncated"],
+    r["row_count"] == 7043 and not r.get("result_too_large"),
     f"{r['row_count']} rows",
 )
 del os.environ["CHURN_MCP_MAX_KB"]

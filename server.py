@@ -179,8 +179,9 @@ def run_query(sql: str) -> dict[str, Any]:
 
     Rules: exactly one statement; SELECT (or WITH ... SELECT) only. Results are
     budgeted by size (default ~50 KB, owner-configurable via CHURN_MCP_MAX_KB)
-    to protect the user's context-window cost — oversized results are trimmed
-    with a warning; use aggregation or LIMIT/OFFSET pagination for full data.
+    to protect the user's context-window cost. An oversized result is refused
+    up front with its size and row count (no partial dump, no tokens wasted) —
+    then choose: aggregate, select fewer columns, or paginate via LIMIT/OFFSET.
     Call get_schema first to see real column names and categorical values.
     """
     start = time.perf_counter()
@@ -217,34 +218,39 @@ def run_query(sql: str) -> dict[str, Any]:
              duration_ms=(time.perf_counter() - start) * 1000)
         return {"error": f"Query failed: {e}", "sql": sql}
 
-    # Keep rows until the payload budget is spent (unlimited if disabled).
-    rows: list[tuple] = []
-    budget = _payload_budget_chars()
-    for row in fetched:
-        budget -= len(str(row))
-        if budget < 0:
-            break
-        rows.append(row)
-    truncated = len(rows) < len(fetched)
+    duration_ms = (time.perf_counter() - start) * 1000
+    payload_chars = sum(len(str(row)) for row in fetched)
 
-    _log("run_query", sql, "ok", rows=len(rows),
-         duration_ms=(time.perf_counter() - start) * 1000)
+    # Cost guardrail: an oversized result is REFUSED UP FRONT with metadata,
+    # never shipped partially. A trimmed dump would cost the full budget in
+    # client tokens and still be useless (incomplete), forcing a paid retry.
+    # Instead the client learns the size for a few hundred bytes and decides
+    # itself: aggregate, paginate, or have the owner raise the budget.
+    if payload_chars > _payload_budget_chars():
+        _log("run_query", sql, "oversize", f"{len(fetched)} rows, ~{payload_chars // 1000} KB",
+             rows=0, duration_ms=duration_ms)
+        return {
+            "sql": sql,
+            "columns": column_names,
+            "rows": [],
+            "row_count": 0,
+            "result_too_large": True,
+            "total_rows": len(fetched),
+            "estimated_kb": payload_chars // 1000,
+            "guidance": "The full result was computed but not returned: it would cost "
+            f"~{payload_chars // 1000} KB of the user's context window (budget: "
+            f"{os.environ.get('CHURN_MCP_MAX_KB', DEFAULT_MAX_KB)} KB). Decide what the "
+            "question actually needs: aggregate (GROUP BY / COUNT / AVG) for insights, "
+            "SELECT fewer columns, or page through with LIMIT/OFFSET. The owner can raise "
+            "or disable the budget via CHURN_MCP_MAX_KB (0 = unlimited).",
+        }
+
+    _log("run_query", sql, "ok", rows=len(fetched), duration_ms=duration_ms)
     return {
         "sql": sql,
         "columns": column_names,
-        "rows": rows,
-        "row_count": len(rows),
-        "truncated": truncated,
-        **(
-            {
-                "warning": f"Result trimmed to {len(rows)} of {len(fetched)} rows to "
-                "respect the response-size budget (context-window cost guardrail; "
-                "owner-configurable via CHURN_MCP_MAX_KB, 0 = unlimited). Use "
-                "aggregation, fewer columns, or LIMIT/OFFSET to get the rest."
-            }
-            if truncated
-            else {}
-        ),
+        "rows": fetched,
+        "row_count": len(fetched),
     }
 
 
