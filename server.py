@@ -325,10 +325,12 @@ def run_query(sql: str) -> dict[str, Any]:
             "size_kb": os.path.getsize(path) // 1000,
             "preview_rows": fetched[:5],
             "note": "Result too large for an inline chat response, so the COMPLETE "
-            "result was saved to the CSV at 'path' — give the user that path. If they "
-            "wanted an insight rather than raw rows, consider an aggregated query "
-            "instead. (Inline threshold is owner-configurable: CHURN_MCP_MAX_KB, "
-            "0 = always inline.)",
+            "result was saved to the CSV at 'path' — give the user that path; the "
+            "file is for THEM (Excel/BI/scripts), do not read it back into the "
+            "conversation unless they explicitly ask. Use preview_rows to describe "
+            "its shape. If they wanted an insight rather than raw rows, run an "
+            "aggregated query instead. (Inline threshold is owner-configurable: "
+            "CHURN_MCP_MAX_KB, 0 = always inline.)",
         }
 
     _log("run_query", sql, "ok", rows=len(fetched), duration_ms=duration_ms)
