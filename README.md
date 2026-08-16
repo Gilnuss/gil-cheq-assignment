@@ -37,7 +37,7 @@ artifact; the server unions all three files into a single `customers` table.
 Requires Python 3.10+.
 
 ```bash
-git clone https://github.com/Gilnuss/telco-churn-mcp.git
+git clone https://github.com/Gilnuss/gil-cheq-assignment.git
 cd telco-churn-mcp
 python3 -m venv .venv
 .venv/bin/pip install -e .

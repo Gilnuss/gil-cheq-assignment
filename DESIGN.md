@@ -1,6 +1,6 @@
 # Design Document — Telco Churn Analytics MCP Server
 
-**Gil Nussbaum · August 2026 · [github.com/Gilnuss/telco-churn-mcp](https://github.com/Gilnuss/telco-churn-mcp)**
+**Gil Nussbaum · August 2026 · [github.com/Gilnuss/gil-cheq-assignment](https://github.com/Gilnuss/gil-cheq-assignment)**
 
 ## Design: what it is and how it answers questions
 
