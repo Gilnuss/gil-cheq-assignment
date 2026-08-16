@@ -25,7 +25,7 @@ All controls sit below the model, never in a prompt:
 
 1. **Engine** — external access off and configuration locked; data served from an in-memory copy.
 2. **Query** — DuckDB's own parser gates every call: one statement, SELECT only.
-3. **Output (cost)** — responses budgeted by size (~50 KB): results land in the user's paid context window, so wide dumps are trimmed with a warning; narrow results keep thousands of rows.
+3. **Output (cost)** — responses budgeted by size (default ~50 KB): results land in the user's paid context window. Policy, not a limit: owner-configurable (`CHURN_MCP_MAX_KB`, 0 = off), and full data stays reachable via pagination.
 4. **Audit** — every call logged to a DuckDB table the LLM-facing connection cannot reach.
 
 A committed `smoke_test.py` proves it: 15 attacks (injection, exfiltration, config re-enable…) — 15/15 blocked — plus ground-truth checks (26.54% churn).
@@ -42,7 +42,7 @@ A committed `smoke_test.py` proves it: 15 attacks (injection, exfiltration, conf
 - **Confidently wrong SQL** (worst case) → schema grounding, SQL echoed for audit, curated summary tool, CI evals.
 - **Malicious / injected queries** → engine-level read-only, adversarially tested.
 - **Misread semantics** (e.g. 0/1 flags) → semantic notes in `get_schema`.
-- **Runaway cost** — every returned row is paid for in client tokens, on every following turn → size-budgeted responses (~50 KB) with a "use aggregation" nudge.
+- **Runaway cost** — every returned row is paid for in client tokens, on every following turn → configurable size budget (default ~50 KB) with a "use aggregation" nudge; never blocks access to full data.
 
 ## Business impact at CHEQ
 

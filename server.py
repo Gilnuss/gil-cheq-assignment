@@ -26,11 +26,24 @@ DATA_GLOB = os.path.join(_BASE_DIR, "data", "*.csv")
 LOG_DB = os.path.join(_BASE_DIR, "logs", "query_log.duckdb")
 
 # Cost guardrail: everything returned lands in the client LLM's context window,
-# which the user pays for per token (and re-pays on every following turn). Cap
-# the response by PAYLOAD SIZE — the actual unit of cost — not by an arbitrary
-# small row count. ~50 KB ≈ 12k tokens: cents, not dollars, per question.
-MAX_PAYLOAD_CHARS = 50_000
-HARD_MAX_ROWS = 2_000   # absolute backstop regardless of row width
+# which the user pays for per token (and re-pays on every following turn). The
+# response budget is by PAYLOAD SIZE — the actual unit of cost — and it is the
+# OWNER'S policy, not the tool's: configurable via CHURN_MCP_MAX_KB (default 50,
+# ~12k tokens; set 0 to disable and return everything). The tool defaults safe
+# but never dictates — full data is always reachable via pagination or a higher
+# budget.
+DEFAULT_MAX_KB = 50
+
+
+def _payload_budget_chars() -> float:
+    """Read each call so the owner can tune without restarting anything."""
+    try:
+        kb = float(os.environ.get("CHURN_MCP_MAX_KB", DEFAULT_MAX_KB))
+    except ValueError:
+        kb = DEFAULT_MAX_KB
+    return kb * 1000 if kb > 0 else float("inf")
+
+
 MAX_SAMPLE = 20         # cap for sample_rows
 MAX_DISTINCT = 30       # columns with more distinct values than this are not enumerated
 
@@ -165,8 +178,9 @@ def run_query(sql: str) -> dict[str, Any]:
     results along with the SQL that was executed (so the answer is auditable).
 
     Rules: exactly one statement; SELECT (or WITH ... SELECT) only. Results are
-    budgeted by size (~50 KB) to protect the user's context-window cost — large
-    results are trimmed with a warning, so prefer aggregation over raw dumps.
+    budgeted by size (default ~50 KB, owner-configurable via CHURN_MCP_MAX_KB)
+    to protect the user's context-window cost — oversized results are trimmed
+    with a warning; use aggregation or LIMIT/OFFSET pagination for full data.
     Call get_schema first to see real column names and categorical values.
     """
     start = time.perf_counter()
@@ -195,7 +209,7 @@ def run_query(sql: str) -> dict[str, Any]:
     try:
         cursor = CON.execute(sql)
         column_names = [d[0] for d in cursor.description]
-        fetched = cursor.fetchmany(HARD_MAX_ROWS + 1)
+        fetched = cursor.fetchall()
     except duckdb.Error as e:
         # Return the engine's message verbatim — it usually names the bad
         # column/value, which lets the client self-correct and retry.
@@ -203,10 +217,10 @@ def run_query(sql: str) -> dict[str, Any]:
              duration_ms=(time.perf_counter() - start) * 1000)
         return {"error": f"Query failed: {e}", "sql": sql}
 
-    # Keep rows until the payload budget is spent.
+    # Keep rows until the payload budget is spent (unlimited if disabled).
     rows: list[tuple] = []
-    budget = MAX_PAYLOAD_CHARS
-    for row in fetched[:HARD_MAX_ROWS]:
+    budget = _payload_budget_chars()
+    for row in fetched:
         budget -= len(str(row))
         if budget < 0:
             break
@@ -223,9 +237,10 @@ def run_query(sql: str) -> dict[str, Any]:
         "truncated": truncated,
         **(
             {
-                "warning": f"Result trimmed to {len(rows)} rows to respect the "
-                f"~{MAX_PAYLOAD_CHARS // 1000} KB response budget (context-window cost "
-                "guardrail). Use aggregation, fewer columns, or LIMIT/OFFSET to paginate."
+                "warning": f"Result trimmed to {len(rows)} of {len(fetched)} rows to "
+                "respect the response-size budget (context-window cost guardrail; "
+                "owner-configurable via CHURN_MCP_MAX_KB, 0 = unlimited). Use "
+                "aggregation, fewer columns, or LIMIT/OFFSET to get the rest."
             }
             if truncated
             else {}

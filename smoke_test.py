@@ -63,8 +63,8 @@ check("float division (no silent integer truncation)", 0 < r < 1, str(r))
 r = server.run_query("SELECT * FROM customers")
 payload = len(str(r["rows"]))
 check(
-    "payload budget enforced on wide dump",
-    r["truncated"] and payload <= server.MAX_PAYLOAD_CHARS * 1.1,
+    "default payload budget trims wide dump",
+    r["truncated"] and payload <= server.DEFAULT_MAX_KB * 1000 * 1.1,
     f"{r['row_count']} rows, ~{payload // 1000} KB",
 )
 r = server.run_query('SELECT "Customer ID" FROM customers LIMIT 1500')
@@ -73,6 +73,16 @@ check(
     r["row_count"] == 1500 and not r["truncated"],
     f"{r['row_count']} rows",
 )
+import os
+
+os.environ["CHURN_MCP_MAX_KB"] = "0"  # owner disables the budget -> unlimited
+r = server.run_query("SELECT * FROM customers")
+check(
+    "budget disabled returns every row",
+    r["row_count"] == 7043 and not r["truncated"],
+    f"{r['row_count']} rows",
+)
+del os.environ["CHURN_MCP_MAX_KB"]
 
 print("== Tool sanity ==")
 schema = server.get_schema()
