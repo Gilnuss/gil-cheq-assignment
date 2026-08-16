@@ -35,6 +35,7 @@ A committed `smoke_test.py` proves it: 15 attacks (injection, exfiltration, conf
 - CSVs → the **warehouse** (Snowflake/BigQuery); local stdio → remote authenticated service (SSO).
 - **RLS + column masking** per authenticated user, enforced in the engine. (Absent today by design: one local analyst, no user identity.)
 - **PII** (synthetic here): hash identifiers at ingestion, mask by role, suppress small result groups (k-anonymity).
+- **Bulk export path**: the size budget exists because the chat channel is physically finite (a full raw dump can't fit an LLM context window regardless of policy). Production adds an `export_result` tool — full results written to CSV/S3, link returned. Chat delivers insight; files deliver bulk. No user is ever capped.
 - CI **eval set** of question→answer pairs to catch accuracy regressions; rate limits, timeouts, centralized audit log.
 
 ## Risks
