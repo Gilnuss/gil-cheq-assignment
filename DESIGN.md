@@ -2,26 +2,48 @@
 
 **Gil Nussbaum · August 2026 · [github.com/Gilnuss/gil-cheq-assignment](https://github.com/Gilnuss/gil-cheq-assignment)**
 
-## Design: what it is and how it answers questions
+## Design
 
-A local **text-to-SQL MCP server** (Python, ~200 lines) over the Telco Customer Churn dataset (7,043 customers, 52 columns, committed to the repo; train/val/test splits unioned — the split is an ML artifact, analytics wants all customers). The MCP client (Claude Code / Codex) **is the LLM**: it calls `get_schema`, writes DuckDB SQL, executes via `run_query`, and interprets results. Four tools: **`get_schema`** — real column types, actual categorical values, and semantic notes (Churn is 0/1 so rate = `AVG(Churn)`; `Internet Service` is a flag, `Internet Type` the category; churn reasons are NULL for retained customers) — the anti-hallucination layer; **`run_query`** — validated read-only SQL that echoes the executed SQL in every response, making every answer auditable; **`churn_summary`** — curated headline stats so broad questions never depend on SQL generation; **`sample_rows`** — capped orientation. No API key exists anywhere: the server never calls a model, it is called *by* one.
+A local **text-to-SQL MCP server** (Python + DuckDB, ~250 lines) over the Telco churn dataset (7,043 customers, 52 columns, committed to the repo). The MCP client (Claude Code / Codex) **is the LLM**: it reads the schema, writes SQL, and interprets results. Four tools:
 
-## Why this and not RAG (or SQLite)
+- **`get_schema`** — real column types, actual categorical values, semantic notes (e.g. churn rate = `AVG(Churn)`). The anti-hallucination layer.
+- **`run_query`** — read-only SQL; every response echoes the SQL it ran, so answers are auditable.
+- **`churn_summary`** — curated headline stats; broad questions never depend on SQL generation.
+- **`sample_rows`** — capped orientation.
 
-The questions this data invites — rates, medians, group-bys, "why are high-CLTV customers leaving" — are **aggregations**. Embedding rows and retrieving top-k chunks cannot count, average, or group; RAG over tabular data produces fluent, unverifiable approximations. SQL returns exact numbers with an audit trail. Alternatives were considered and deliberately rejected: a *fixed catalog of canned queries* (can't serve the long tail), and the common *server-side `ask(question)` design*, where the server calls its own LLM (API key, per-question cost) to write SQL and returns finished answers. That design hides the reasoning in a black box. This one follows MCP's actual premise — **the client brings the brain, the server brings the tools**: the user already sits inside an AI tool, so instead of answering *for* them we hand their model grounded schema, safe query execution, and visible intermediate steps. The user watches the SQL being written, sees it echoed with every result, and can challenge any number — transparency and trust over a second model's opinion, at zero marginal cost and with no secrets to manage. **DuckDB over SQLite**: at 7K rows either works; DuckDB queries the committed CSVs directly (zero ETL, so the reviewer's first run can't fail on a build step), its columnar engine matches a 100%-analytical workload, and its dialect avoids classic LLM-SQL failures — `MEDIAN()` exists and `385/7043` is a float, not SQLite's silent `0` (a wrong-churn-rate bug waiting to happen).
+No API key: the server never calls a model — it is called *by* one.
 
-## Guardrails (implemented) — principle: the LLM is the untrusted component
+## Why
 
-All controls sit **below** the model, in the parser and engine — never in a prompt, which can be talked out of. **(1) Engine:** `enable_external_access=false` (SQL cannot touch filesystem/network/extensions), then `lock_configuration=true` (no query can undo it); data served from an in-memory copy — no code path writes the CSVs. **(2) Query:** DuckDB's own parser (not regex) gates every call: one statement, SELECT-type only; PRAGMA/CALL rejected (adversarial testing found DuckDB rewrites read-only PRAGMAs into SELECTs — closed explicitly). **(3) Output:** 200-row cap so results can't flood the client context. **(4) Audit:** every tool call is appended to a queryable DuckDB table (`logs/query_log.duckdb`: timestamp, SQL, ok/blocked/error, rows, latency) through a separate writer connection the LLM-facing connection cannot reach — the model can query the data but never read or tamper with its own audit trail; it doubles as product telemetry (what users ask, what gets blocked, what fails). A committed `smoke_test.py` runs a 15-attack suite (multi-statement injection, `COPY TO` exfiltration, `/etc/passwd` read, config re-enable…) — 15/15 blocked — plus ground-truth checks (7,043 / 1,869 / 26.54%).
+The natural questions here — rates, medians, group-bys — are **aggregations**. RAG can't count or average; SQL gives exact, checkable numbers. Also rejected: canned queries (no long tail) and the server-side `ask()` design that calls its own LLM — it hides reasoning in a black box. We follow MCP's premise: **the client brings the brain, the server brings the tools.** The user's own AI writes the SQL in the open; they see it, and can challenge it.
 
-## Production: what changes with real data and real users
+**DuckDB over SQLite:** queries the CSVs directly (zero ETL), built for analytics, and its dialect avoids classic LLM-SQL bugs — `MEDIAN()` exists, and division isn't silently integer.
 
-Swap CSVs for the **warehouse** (Snowflake/BigQuery) behind the same tool interface; MCP server becomes a **remote authenticated service** (SSO/OAuth) instead of local stdio. **Row/column-level security** enforced in the engine per authenticated principal — RLS is deliberately absent today because there is no user identity: one local analyst, and cross-customer aggregation *is* the product. **PII** (synthetic here, but the shape is sensitive — Age+Gender+Zip+Lat/Long re-identifies): drop/hash identifiers at ingestion, engine-level masking by role, k-anonymity suppression of small result groups. Plus: the local audit table becomes a centralized, per-user query log; per-user rate limits and query timeouts, an evaluation set of question→answer pairs run in CI to catch accuracy regressions, and observability on tool-call failure rates.
+## Guardrails — the LLM is the untrusted component
 
-## Risks and mitigations
+All controls sit below the model, never in a prompt:
 
-**Wrong-but-confident answers** (worst failure — silently wrong SQL): mitigated by schema grounding with real values, SQL echoed for human audit, curated `churn_summary` for common questions, verbatim engine errors so the model self-corrects (`Did you mean "customers"?`); production adds the CI eval set. **Prompt injection / malicious SQL**: blast radius is bounded by engine-level read-only + no-external-access — tested adversarially, not assumed. **Misreading data semantics** (e.g., averaging a 0/1 flag as if dollars): semantic notes in `get_schema` encode the traps. **Context flooding**: row caps. **Stale data** (production): the warehouse connection replaces snapshots.
+1. **Engine** — external access off and configuration locked; data served from an in-memory copy.
+2. **Query** — DuckDB's own parser gates every call: one statement, SELECT only.
+3. **Output** — 200-row cap.
+4. **Audit** — every call logged to a DuckDB table the LLM-facing connection cannot reach.
+
+A committed `smoke_test.py` proves it: 15 attacks (injection, exfiltration, config re-enable…) — 15/15 blocked — plus ground-truth checks (26.54% churn).
+
+## Production
+
+- CSVs → the **warehouse** (Snowflake/BigQuery); local stdio → remote authenticated service (SSO).
+- **RLS + column masking** per authenticated user, enforced in the engine. (Absent today by design: one local analyst, no user identity.)
+- **PII** (synthetic here): hash identifiers at ingestion, mask by role, suppress small result groups (k-anonymity).
+- CI **eval set** of question→answer pairs to catch accuracy regressions; rate limits, timeouts, centralized audit log.
+
+## Risks
+
+- **Confidently wrong SQL** (worst case) → schema grounding, SQL echoed for audit, curated summary tool, CI evals.
+- **Malicious / injected queries** → engine-level read-only, adversarially tested.
+- **Misread semantics** (e.g. 0/1 flags) → semantic notes in `get_schema`.
+- **Context flooding** → row caps.
 
 ## Business impact at CHEQ
 
-CHEQ's product generates exactly this shape of data at scale: traffic verdicts, invalid-click events, bot classifications, customer account health. Today, questions like *"which customers saw the biggest spike in invalid traffic this week?"* or *"what fraud categories drive churn-risk accounts?"* queue behind analysts and SQL skills. This pattern — **schema-grounded, engine-guarded, auditable text-to-SQL via MCP** — gives every CS manager, sales engineer, and security analyst direct natural-language access to that data with provable safety (read-only, RLS-ready) and verifiable answers (SQL attached). Internally it shortens insight loops from days to minutes; externally the same server, pointed at per-tenant data with RLS, becomes a customer-facing "ask your traffic data" feature — a differentiator competitors' static dashboards don't have.
+CHEQ's product generates this exact data shape at scale: traffic verdicts, invalid-click events, account health. Questions like *"which customers spiked in invalid traffic this week?"* currently queue behind analysts. This pattern gives every CS manager and security analyst **safe, auditable, natural-language access** to that data — insight loops drop from days to minutes. Pointed at per-tenant data with RLS, the same server becomes a customer-facing "ask your traffic data" feature competitors' static dashboards can't match.
