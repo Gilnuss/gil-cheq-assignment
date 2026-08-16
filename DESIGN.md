@@ -9,7 +9,10 @@ A local **text-to-SQL MCP server** (Python + DuckDB, ~250 lines) over the Telco 
 - **`get_schema`** — real column types, actual categorical values, semantic notes (e.g. churn rate = `AVG(Churn)`). The anti-hallucination layer.
 - **`run_query`** — read-only SQL; every response echoes the SQL it ran, so answers are auditable.
 - **`churn_summary`** — curated headline stats; broad questions never depend on SQL generation.
+- **`export_result`** — complete results to CSV at any size, zero context cost: chat delivers insight, files deliver bulk.
 - **`sample_rows`** — capped orientation.
+
+Server-delivered **MCP instructions** teach the client the strategy at handshake: schema first, aggregate for insight, export for bulk.
 
 No API key: the server never calls a model — it is called *by* one.
 
@@ -25,7 +28,7 @@ All controls sit below the model, never in a prompt:
 
 1. **Engine** — external access off and configuration locked; data served from an in-memory copy.
 2. **Query** — DuckDB's own parser gates every call: one statement, SELECT only.
-3. **Output (cost)** — responses budgeted by size (default ~50 KB): results land in the user's paid context window. Oversized results are refused up front with row count + size — never shipped partially — so the LLM decides (aggregate / fewer columns / paginate) without paying for a wasted dump. Policy, not a limit: owner-configurable (`CHURN_MCP_MAX_KB`, 0 = off).
+3. **Output (cost)** — responses budgeted by size (default ~50 KB): results land in the user's paid context window. Oversized results are refused up front with row count + size — never shipped partially — and the LLM decides: aggregate for insight, or `export_result` for the full raw data. Policy, not a limit: owner-configurable (`CHURN_MCP_MAX_KB`, 0 = off), and users are never capped — bulk data just travels by file, the channel built for it.
 4. **Audit** — every call logged to a DuckDB table the LLM-facing connection cannot reach.
 
 A committed `smoke_test.py` proves it: 15 attacks (injection, exfiltration, config re-enable…) — 15/15 blocked — plus ground-truth checks (26.54% churn).
@@ -35,7 +38,7 @@ A committed `smoke_test.py` proves it: 15 attacks (injection, exfiltration, conf
 - CSVs → the **warehouse** (Snowflake/BigQuery); local stdio → remote authenticated service (SSO).
 - **RLS + column masking** per authenticated user, enforced in the engine. (Absent today by design: one local analyst, no user identity.)
 - **PII** (synthetic here): hash identifiers at ingestion, mask by role, suppress small result groups (k-anonymity).
-- **Bulk export path**: the size budget exists because the chat channel is physically finite (a full raw dump can't fit an LLM context window regardless of policy). Production adds an `export_result` tool — full results written to CSV/S3, link returned. Chat delivers insight; files deliver bulk. No user is ever capped.
+- **Bulk export at scale**: the size budget exists because the chat channel is physically finite (a full raw dump can't fit an LLM context window regardless of policy). `export_result` already solves this locally with CSV files; production swaps the destination for S3/GCS presigned links.
 - CI **eval set** of question→answer pairs to catch accuracy regressions; rate limits, timeouts, centralized audit log.
 
 ## Risks

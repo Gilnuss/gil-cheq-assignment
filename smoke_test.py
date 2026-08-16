@@ -83,6 +83,21 @@ check(
 )
 del os.environ["CHURN_MCP_MAX_KB"]
 
+print("== Export channel ==")
+r = server.export_result("SELECT * FROM customers", "full_table")
+check(
+    "exports complete table to CSV",
+    r.get("rows_written") == 7043 and os.path.exists(r["path"]),
+    f"{r.get('rows_written')} rows, {r.get('size_kb')} KB -> {os.path.basename(r.get('path',''))}",
+)
+check("export blocks non-SELECT", "error" in server.export_result("DROP TABLE customers"))
+r = server.export_result("SELECT 1", "../../evil")
+check(
+    "export sanitizes path traversal",
+    "error" not in r and os.path.dirname(r["path"]) == server.EXPORT_DIR,
+    os.path.basename(r.get("path", "")),
+)
+
 print("== Tool sanity ==")
 schema = server.get_schema()
 check("schema: 52 columns", len(schema["columns"]) == 52)

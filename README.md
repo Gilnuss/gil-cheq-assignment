@@ -30,7 +30,12 @@ artifact; the server unions all three files into a single `customers` table.
 | `get_schema` | All 52 columns with types, real categorical values, numeric ranges, and semantic notes (the anti-hallucination layer — call before writing SQL) |
 | `run_query` | Execute read-only SQL; every response echoes the SQL it ran, so answers are auditable |
 | `churn_summary` | Pre-computed headline stats: churn rate overall / by contract / internet type / tenure band, top churn reasons, revenue at stake |
+| `export_result` | Write a query's **complete** result to a CSV in `exports/` — any size, zero context cost. The bulk-data channel: chat delivers insight, files deliver bulk |
 | `sample_rows` | A few example rows for orientation (capped at 20) |
+
+The server also ships **MCP instructions** — a strategy guide delivered to the client at
+handshake (schema first, aggregate for insight, export for bulk) so the model uses the tools
+well from the first question.
 
 ## Setup
 
@@ -95,7 +100,9 @@ it**, in the parser and the engine, never in a prompt.
    bytes and decides itself — aggregate, select fewer columns, or paginate with
    `LIMIT/OFFSET` (full data always reachable, no tokens wasted on a partial dump). The
    budget is **policy, not a limit of the tool** — set `CHURN_MCP_MAX_KB` to raise it, or
-   `0` to disable it entirely.
+   `0` to disable it entirely. And bulk raw data has its own channel: `export_result`
+   writes complete results to CSV at any size, so no question and no dataset size is ever
+   out of reach.
 
 `smoke_test.py` runs a 15-attack suite against these layers (multi-statement injection,
 `COPY TO` exfiltration, reading `/etc/passwd`, re-enabling external access, extension installs,

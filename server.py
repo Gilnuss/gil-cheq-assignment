@@ -24,6 +24,7 @@ from mcp.server import MCPServer
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_GLOB = os.path.join(_BASE_DIR, "data", "*.csv")
 LOG_DB = os.path.join(_BASE_DIR, "logs", "query_log.duckdb")
+EXPORT_DIR = os.path.join(_BASE_DIR, "exports")
 
 # Cost guardrail: everything returned lands in the client LLM's context window,
 # which the user pays for per token (and re-pays on every following turn). The
@@ -47,7 +48,20 @@ def _payload_budget_chars() -> float:
 MAX_SAMPLE = 20         # cap for sample_rows
 MAX_DISTINCT = 30       # columns with more distinct values than this are not enumerated
 
-mcp = MCPServer("telco-churn-analytics")
+mcp = MCPServer(
+    "telco-churn-analytics",
+    instructions=(
+        "Analytics over the Telco churn dataset (7,043 customers). Strategy: "
+        "(1) Call get_schema FIRST — filter values must match the real categorical "
+        "values it lists. (2) Answer questions with AGGREGATION (GROUP BY / AVG / "
+        "COUNT) via run_query — exact numbers over all rows, tiny responses. "
+        "(3) When the user needs raw data in bulk (for Excel/BI/inspection), use "
+        "export_result — it writes the COMPLETE result to a CSV file at any size, "
+        "bypassing the chat entirely. Never try to page a whole table through "
+        "run_query. (4) churn_summary answers broad overview questions instantly. "
+        "All queries are read-only SELECT."
+    ),
+)
 
 
 def _connect() -> duckdb.DuckDBPyConnection:
@@ -115,6 +129,26 @@ def _log(
 # Guardrail layer 2 (query validation) uses DuckDB's parser via extract_statements;
 # only these statement types are allowed through.
 _ALLOWED_STATEMENT_TYPES = {duckdb.StatementType.SELECT}
+
+
+def _validate_select(sql: str) -> str | None:
+    """Return a rejection reason, or None if sql is a single SELECT statement."""
+    try:
+        statements = CON.extract_statements(sql)
+    except duckdb.Error as e:
+        return f"SQL parse error: {e}"
+    if len(statements) != 1:
+        return "Exactly one SQL statement is allowed per call."
+    # Read-only PRAGMAs are internally rewritten to SELECTs by DuckDB; reject
+    # them anyway so the SELECT-only guarantee is literal.
+    if sql.lstrip().lstrip("(").lower().startswith("pragma"):
+        return "PRAGMA statements are not allowed. This server is read-only SELECT."
+    if statements[0].type not in _ALLOWED_STATEMENT_TYPES:
+        return (
+            f"Only SELECT queries are allowed; got a "
+            f"{statements[0].type.name} statement. This server is read-only."
+        )
+    return None
 
 _SEMANTIC_NOTES = [
     "One row per customer; 7,043 customers total (train/validation/test CSVs are unioned — the split is an ML artifact, ignore it).",
@@ -186,26 +220,10 @@ def run_query(sql: str) -> dict[str, Any]:
     """
     start = time.perf_counter()
 
-    def blocked(reason: str) -> dict[str, Any]:
-        _log("run_query", sql, "blocked", reason)
-        return {"error": reason}
-
-    try:
-        statements = CON.extract_statements(sql)
-    except duckdb.Error as e:
-        return blocked(f"SQL parse error: {e}")
-
-    if len(statements) != 1:
-        return blocked("Exactly one SQL statement is allowed per call.")
-    # Read-only PRAGMAs are internally rewritten to SELECTs by DuckDB; reject
-    # them anyway so the SELECT-only guarantee is literal.
-    if sql.lstrip().lstrip("(").lower().startswith("pragma"):
-        return blocked("PRAGMA statements are not allowed. This server is read-only SELECT.")
-    if statements[0].type not in _ALLOWED_STATEMENT_TYPES:
-        return blocked(
-            f"Only SELECT queries are allowed; got a "
-            f"{statements[0].type.name} statement. This server is read-only."
-        )
+    rejection = _validate_select(sql)
+    if rejection:
+        _log("run_query", sql, "blocked", rejection)
+        return {"error": rejection}
 
     try:
         cursor = CON.execute(sql)
@@ -240,9 +258,11 @@ def run_query(sql: str) -> dict[str, Any]:
             "guidance": "The full result was computed but not returned: it would cost "
             f"~{payload_chars // 1000} KB of the user's context window (budget: "
             f"{os.environ.get('CHURN_MCP_MAX_KB', DEFAULT_MAX_KB)} KB). Decide what the "
-            "question actually needs: aggregate (GROUP BY / COUNT / AVG) for insights, "
-            "SELECT fewer columns, or page through with LIMIT/OFFSET. The owner can raise "
-            "or disable the budget via CHURN_MCP_MAX_KB (0 = unlimited).",
+            "question actually needs: if the user wants insight, aggregate (GROUP BY / "
+            "COUNT / AVG) or SELECT fewer columns; if the user wants the raw data itself, "
+            "call export_result with this same SQL — it writes the complete result to a "
+            "CSV at any size with zero context cost. The owner can also raise or disable "
+            "the budget via CHURN_MCP_MAX_KB (0 = unlimited).",
         }
 
     _log("run_query", sql, "ok", rows=len(fetched), duration_ms=duration_ms)
@@ -300,6 +320,64 @@ def churn_summary() -> dict[str, Any]:
         "avg_satisfaction": q(
             'SELECT Churn, ROUND(AVG("Satisfaction Score"), 2) FROM customers GROUP BY Churn ORDER BY Churn'
         ),
+    }
+
+
+@mcp.tool()
+def export_result(sql: str, filename: str = "export") -> dict[str, Any]:
+    """Run a read-only SQL query and write the COMPLETE result to a local CSV
+    file — any size, no response budget, nothing shipped through the chat.
+    Returns the file path, row count, and size.
+
+    Use this whenever the user wants raw data in bulk (for Excel, BI tools, or
+    inspection) instead of paging rows through run_query. Same rules as
+    run_query: exactly one SELECT statement.
+    """
+    import csv
+    import re
+
+    start = time.perf_counter()
+
+    rejection = _validate_select(sql)
+    if rejection:
+        _log("export_result", sql, "blocked", rejection)
+        return {"error": rejection}
+
+    # Exports go ONLY into exports/ next to the server; sanitize the name so a
+    # path can't escape it.
+    safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", filename).strip("_") or "export"
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    path = os.path.join(EXPORT_DIR, f"{safe_name}.csv")
+    counter = 1
+    while os.path.exists(path):
+        counter += 1
+        path = os.path.join(EXPORT_DIR, f"{safe_name}_{counter}.csv")
+
+    try:
+        cursor = CON.execute(sql)
+        column_names = [d[0] for d in cursor.description]
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(column_names)
+            row_count = 0
+            while batch := cursor.fetchmany(1000):
+                writer.writerows(batch)
+                row_count += len(batch)
+    except duckdb.Error as e:
+        _log("export_result", sql, "error", str(e),
+             duration_ms=(time.perf_counter() - start) * 1000)
+        return {"error": f"Query failed: {e}", "sql": sql}
+
+    size_kb = os.path.getsize(path) // 1000
+    _log("export_result", sql, "ok", rows=row_count,
+         duration_ms=(time.perf_counter() - start) * 1000)
+    return {
+        "sql": sql,
+        "path": path,
+        "rows_written": row_count,
+        "size_kb": size_kb,
+        "note": "Complete result written to disk — tell the user the file path. "
+        "Do not read the file back into the conversation unless asked.",
     }
 
 
