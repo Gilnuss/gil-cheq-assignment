@@ -25,7 +25,7 @@ The rule: the LLM is not trusted, so every control is enforced below it, never i
 1. **Engine** — no filesystem or network access, memory capped, configuration locked.
 2. **Query** — DuckDB's own parser checks every call: one statement, SELECT only.
 3. **Compute** — queries running past 30s are cancelled (configurable). Even on small data, a cross join can create unbounded work.
-4. **Response routing** — small results return in the chat; large results are saved as a complete CSV and the chat gets the path plus a preview. Nothing is trimmed or refused.
+4. **Response routing** — small results return in the chat; large results are saved as a complete CSV and the chat gets the path plus a preview. The response also reminds the model that if this much raw data was meant to answer a question, a better aggregation is usually the right move. Nothing is trimmed or refused.
 5. **Audit** — every call is logged to a DuckDB table that the query connection cannot touch.
 
 ## Production
