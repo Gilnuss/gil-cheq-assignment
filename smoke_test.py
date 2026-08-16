@@ -83,6 +83,22 @@ check(
 )
 del os.environ["CHURN_MCP_MAX_KB"]
 
+print("== Compute guardrail ==")
+os.environ["CHURN_MCP_TIMEOUT_S"] = "1"
+t0 = __import__("time").perf_counter()
+r = server.run_query(
+    "SELECT SUM(a.Churn * b.Churn * c.Churn) FROM customers a, customers b, customers c"
+)
+elapsed = __import__("time").perf_counter() - t0
+check(
+    "cross-join bomb cancelled by timeout",
+    "error" in r and "timeout" in r["error"] and elapsed < 10,
+    f"cancelled after {elapsed:.1f}s",
+)
+del os.environ["CHURN_MCP_TIMEOUT_S"]
+r = server.run_query("SELECT COUNT(*) FROM customers")
+check("connection healthy after interrupt", r.get("rows") == [(7043,)])
+
 print("== Export channel ==")
 r = server.export_result("SELECT * FROM customers", "full_table")
 check(

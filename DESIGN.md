@@ -28,8 +28,9 @@ All controls sit below the model, never in a prompt:
 
 1. **Engine** — external access off and configuration locked; data served from an in-memory copy.
 2. **Query** — DuckDB's own parser gates every call: one statement, SELECT only.
-3. **Output (cost)** — responses budgeted by size (default ~50 KB): results land in the user's paid context window. Oversized results are refused up front with row count + size — never shipped partially — and the LLM decides: aggregate for insight, or `export_result` for the full raw data. Policy, not a limit: owner-configurable (`CHURN_MCP_MAX_KB`, 0 = off), and users are never capped — bulk data just travels by file, the channel built for it.
-4. **Audit** — every call logged to a DuckDB table the LLM-facing connection cannot reach.
+3. **Compute** — a watchdog cancels queries past a timeout (default 10s, configurable) and engine memory is capped: even on 7K rows, a cross join can manufacture 10¹¹ combinations of work.
+4. **Output (cost)** — responses budgeted by size (default ~50 KB): results land in the user's paid context window. Oversized results are refused up front with row count + size — never shipped partially — and the LLM decides: aggregate for insight, or `export_result` for the full raw data. Policy, not a limit: owner-configurable (`CHURN_MCP_MAX_KB`, 0 = off), and users are never capped — bulk data just travels by file, the channel built for it.
+5. **Audit** — every call logged to a DuckDB table the LLM-facing connection cannot reach.
 
 A committed `smoke_test.py` proves it: 15 attacks (injection, exfiltration, config re-enable…) — 15/15 blocked — plus ground-truth checks (26.54% churn).
 
@@ -47,6 +48,7 @@ A committed `smoke_test.py` proves it: 15 attacks (injection, exfiltration, conf
 - **Malicious / injected queries** → engine-level read-only, adversarially tested.
 - **Misread semantics** (e.g. 0/1 flags) → semantic notes in `get_schema`.
 - **Runaway cost** — every returned row is paid for in client tokens, on every following turn → configurable size budget (default ~50 KB) with a "use aggregation" nudge; never blocks access to full data.
+- **Runaway compute** — a cross join or recursive CTE can burn unbounded CPU/RAM even on small data → watchdog timeout + engine memory cap.
 
 ## Business impact at CHEQ
 

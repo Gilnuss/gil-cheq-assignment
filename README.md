@@ -93,7 +93,12 @@ it**, in the parser and the engine, never in a prompt.
    is served from an in-memory copy; the CSVs on disk are never opened for writing.
 2. **Query layer** — DuckDB's own parser (not regex) classifies every statement: exactly one
    statement per call, type must be SELECT; PRAGMA and CALL are rejected explicitly.
-3. **Output layer (cost guardrail, owner-configurable)** — everything returned lands in the
+3. **Compute layer** — even a small table lets SQL manufacture unbounded work (a 3-way cross
+   join of 7K rows is 3.5×10¹¹ combinations; a recursive CTE can run forever). A watchdog
+   cancels any query past the timeout (default 10s, `CHURN_MCP_TIMEOUT_S`, 0 = off), and the
+   engine's memory is capped at 1 GB — set before the configuration lock, so no query can
+   raise it.
+4. **Output layer (cost guardrail, owner-configurable)** — everything returned lands in the
    client LLM's context window, which you pay for per token. Responses are budgeted by
    **size** (default ~50 KB ≈ 12k tokens), and an oversized result is **refused up front,
    never shipped partially**: the client gets the total row count and size for a few hundred

@@ -15,6 +15,7 @@ server's job is to make that loop accurate and safe:
 from __future__ import annotations
 
 import os
+import threading
 import time
 from typing import Any
 
@@ -79,8 +80,11 @@ def _connect() -> duckdb.DuckDBPyConnection:
     con.execute("DROP VIEW customers")
     con.execute("ALTER TABLE _customers RENAME TO customers")
     # Guardrail layer 1 (engine): no filesystem/network access, no extension
-    # loading, and lock the configuration so a query cannot re-enable any of it.
+    # loading, a memory ceiling so a query bomb (e.g. a giant cross join) can't
+    # eat the machine's RAM — then lock the configuration so a query cannot
+    # re-enable or raise any of it.
     con.execute("SET enable_external_access = false")
+    con.execute("SET memory_limit = '1GB'")
     con.execute("SET lock_configuration = true")
     return con
 
@@ -129,6 +133,38 @@ def _log(
 # Guardrail layer 2 (query validation) uses DuckDB's parser via extract_statements;
 # only these statement types are allowed through.
 _ALLOWED_STATEMENT_TYPES = {duckdb.StatementType.SELECT}
+
+
+# Compute guardrail: SQL can manufacture unbounded WORK even on a small table
+# (a 3-way cross join of 7K rows = 3.5e11 combinations; a recursive CTE can run
+# forever). A watchdog interrupts any query that exceeds the timeout. Owner's
+# policy, like the size budget: CHURN_MCP_TIMEOUT_S (default 10, 0 = off).
+DEFAULT_TIMEOUT_S = 10
+
+
+def _query_timeout_s() -> float:
+    try:
+        s = float(os.environ.get("CHURN_MCP_TIMEOUT_S", DEFAULT_TIMEOUT_S))
+    except ValueError:
+        s = DEFAULT_TIMEOUT_S
+    return s if s > 0 else float("inf")
+
+
+def _execute_guarded(sql: str) -> duckdb.DuckDBPyConnection:
+    """Execute on the guarded connection under the compute watchdog.
+
+    Safe because the stdio server handles one request at a time, so the
+    interrupt can only hit the query that armed it.
+    """
+    timeout = _query_timeout_s()
+    if timeout == float("inf"):
+        return CON.execute(sql)
+    watchdog = threading.Timer(timeout, CON.interrupt)
+    watchdog.start()
+    try:
+        return CON.execute(sql)
+    finally:
+        watchdog.cancel()
 
 
 def _validate_select(sql: str) -> str | None:
@@ -226,9 +262,19 @@ def run_query(sql: str) -> dict[str, Any]:
         return {"error": rejection}
 
     try:
-        cursor = CON.execute(sql)
+        cursor = _execute_guarded(sql)
         column_names = [d[0] for d in cursor.description]
         fetched = cursor.fetchall()
+    except duckdb.InterruptException:
+        reason = (
+            f"Query exceeded the {_query_timeout_s():.0f}s compute timeout and was "
+            "cancelled (guardrail against runaway compute, e.g. huge cross joins). "
+            "Simplify the query — check JOIN conditions and recursive CTEs. The owner "
+            "can adjust via CHURN_MCP_TIMEOUT_S (0 = off)."
+        )
+        _log("run_query", sql, "timeout", reason,
+             duration_ms=(time.perf_counter() - start) * 1000)
+        return {"error": reason, "sql": sql}
     except duckdb.Error as e:
         # Return the engine's message verbatim — it usually names the bad
         # column/value, which lets the client self-correct and retry.
@@ -354,7 +400,7 @@ def export_result(sql: str, filename: str = "export") -> dict[str, Any]:
         path = os.path.join(EXPORT_DIR, f"{safe_name}_{counter}.csv")
 
     try:
-        cursor = CON.execute(sql)
+        cursor = _execute_guarded(sql)
         column_names = [d[0] for d in cursor.description]
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
@@ -363,6 +409,15 @@ def export_result(sql: str, filename: str = "export") -> dict[str, Any]:
             while batch := cursor.fetchmany(1000):
                 writer.writerows(batch)
                 row_count += len(batch)
+    except duckdb.InterruptException:
+        reason = (
+            f"Query exceeded the {_query_timeout_s():.0f}s compute timeout and was "
+            "cancelled. Simplify the query, or the owner can adjust "
+            "CHURN_MCP_TIMEOUT_S (0 = off)."
+        )
+        _log("export_result", sql, "timeout", reason,
+             duration_ms=(time.perf_counter() - start) * 1000)
+        return {"error": reason, "sql": sql}
     except duckdb.Error as e:
         _log("export_result", sql, "error", str(e),
              duration_ms=(time.perf_counter() - start) * 1000)
