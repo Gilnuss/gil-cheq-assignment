@@ -4,52 +4,49 @@
 
 ## Design
 
-A local **text-to-SQL MCP server** (Python + DuckDB, ~250 lines) over the Telco churn dataset (7,043 customers, 52 columns, committed to the repo). The MCP client (Claude Code / Codex) **is the LLM**: it reads the schema, writes SQL, and interprets results. Four tools:
+An MCP server in Python over the Telco churn dataset (7,043 customers, 52 columns, committed to the repo). The client (Claude Code or Codex) writes the SQL itself: it reads the schema from the server, sends a query, and gets exact results back. Five tools:
 
-- **`get_schema`** — real column types, actual categorical values, semantic notes (e.g. churn rate = `AVG(Churn)`). The anti-hallucination layer.
-- **`run_query`** — read-only SQL; every response echoes the SQL it ran, so answers are auditable.
-- **`churn_summary`** — curated headline stats; broad questions never depend on SQL generation.
-- **`export_result`** — complete results to CSV at any size, zero context cost: chat delivers insight, files deliver bulk.
-- **`sample_rows`** — capped orientation.
+- **get_schema** — column types, the real category values, and notes about the data's quirks, so the model doesn't guess wrong values.
+- **run_query** — runs a read-only SQL query and returns the result together with the SQL that ran, so every answer can be checked.
+- **churn_summary** — ready-made headline stats for overview questions.
+- **export_result** — writes a full query result to a CSV file, for when the user wants the raw data itself.
+- **sample_rows** — a few example rows.
 
-Server-delivered **MCP instructions** teach the client the strategy at handshake: schema first, aggregate for insight, export for bulk.
-
-No API key: the server never calls a model — it is called *by* one.
+The server also sends short usage instructions to the client when it connects: read the schema first, aggregate for insights, export for bulk data.
 
 ## Why
 
-The natural questions here — rates, medians, group-bys — are **aggregations**. RAG can't count or average; SQL gives exact, checkable numbers. Also rejected: canned queries (no long tail) and the server-side `ask()` design that calls its own LLM — it hides reasoning in a black box. We follow MCP's premise: **the client brings the brain, the server brings the tools.** The user's own AI writes the SQL in the open; they see it, and can challenge it.
+We use DuckDB as the query engine because for this dataset we mostly run aggregations (rates, group-bys, medians). DuckDB queries the CSV files directly so there is no ETL step, and it is built for exactly this kind of analytical workload. It also lets us control which queries are allowed, limit usage and avoid abuse.
 
-**Why DuckDB:** it queries the committed CSVs directly (zero ETL, nothing to build), it's an engine designed for exactly this analytical workload, and its SQL dialect keeps LLM-written queries correct.
+We chose SQL over RAG because RAG cannot count or average, and these questions need exact numbers. We also decided not to call an LLM from inside the server: the client already has a model, and keeping the generated SQL visible means answers can be verified instead of trusted.
 
-## Guardrails — the LLM is the untrusted component
+## Guardrails
 
-All controls sit below the model, never in a prompt:
+The rule: the LLM is not trusted, so every control is enforced below it, never in a prompt.
 
-1. **Engine** — external access off and configuration locked; data served from an in-memory copy.
-2. **Query** — DuckDB's own parser gates every call: one statement, SELECT only.
-3. **Compute** — a watchdog cancels queries past a timeout (default 30s, configurable) and engine memory is capped: even on 7K rows, a cross join can manufacture 10¹¹ combinations of work.
-4. **Response routing** — like email: text inline, attachments as files. Small results return in the chat; results too large for a chat response (~50 KB threshold, configurable) are automatically delivered as a complete CSV with path + preview. Nothing is refused, trimmed, or lost.
-5. **Audit** — every call logged to a DuckDB table the LLM-facing connection cannot reach.
+1. **Engine** — no filesystem or network access, memory capped, configuration locked.
+2. **Query** — DuckDB's own parser checks every call: one statement, SELECT only.
+3. **Compute** — queries running past 30s are cancelled (configurable). Even on small data, a cross join can create unbounded work.
+4. **Response routing** — small results return in the chat; large results are saved as a complete CSV and the chat gets the path plus a preview. Nothing is trimmed or refused.
+5. **Audit** — every call is logged to a DuckDB table that the query connection cannot touch.
 
-A committed `smoke_test.py` verifies all of it: attacks blocked, ground-truth answers correct.
+`smoke_test.py` checks all of this: attacks are blocked, known answers come back correct.
 
 ## Production
 
-- CSVs + DuckDB → the **warehouse** (Snowflake/BigQuery) as the engine; same tool interface, guardrails become warehouse-native (read-only role, resource monitors). Local stdio → remote authenticated service (SSO).
-- **RLS + column masking** per authenticated user, enforced in the engine. (Absent today by design: one local analyst, no user identity.)
-- **PII** (synthetic here): hash identifiers at ingestion, mask by role, suppress small result groups (k-anonymity).
-- **Bulk export at scale**: the size budget exists because the chat channel is physically finite (a full raw dump can't fit an LLM context window regardless of policy). `export_result` already solves this locally with CSV files; production swaps the destination for S3/GCS presigned links.
-- CI **eval set** of question→answer pairs to catch accuracy regressions; rate limits, timeouts, centralized audit log.
+- Replace the CSVs and DuckDB with the company warehouse (e.g. Snowflake) as the engine. The tools stay the same; the guardrails move to warehouse features (read-only role, statement timeouts, resource monitors).
+- The server becomes a remote service behind SSO, with row and column permissions per user, enforced in the engine.
+- With real PII: hash identifiers at ingestion, mask columns by role, block queries that single out individuals.
+- Exports go to S3 links instead of local files.
+- A test set of questions with known answers runs in CI, so accuracy regressions are caught before users see them.
 
 ## Risks
 
-- **Confidently wrong SQL** (worst case) → schema grounding, SQL echoed for audit, curated summary tool, CI evals.
-- **Malicious / injected queries** → engine-level read-only, adversarially tested.
-- **Misread semantics** (e.g. 0/1 flags) → semantic notes in `get_schema`.
-- **Runaway cost** — a huge inline result would burn client tokens on every following turn → response routing: big results go to file automatically, chat carries only the path and a preview.
-- **Runaway compute** — a cross join or recursive CTE can burn unbounded CPU/RAM even on small data → watchdog timeout + engine memory cap.
+- **Wrong but confident SQL** — the biggest risk. Reduced by giving the model the real schema values, returning the SQL with every answer, and the curated summary tool.
+- **Malicious queries** — the engine cannot write or reach outside the data; verified with an attack suite.
+- **Misreading the data** (e.g. treating a 0/1 flag as money) — covered by the notes in get_schema.
+- **Runaway compute or cost** — timeout, memory cap, and response routing.
 
 ## Business impact at CHEQ
 
-CHEQ's product generates this exact data shape at scale: traffic verdicts, invalid-click events, account health. Questions like *"which customers spiked in invalid traffic this week?"* currently queue behind analysts. This pattern gives every CS manager and security analyst **safe, auditable, natural-language access** to that data — insight loops drop from days to minutes. Pointed at per-tenant data with RLS, the same server becomes a customer-facing "ask your traffic data" feature competitors' static dashboards can't match.
+CHEQ produces the same shape of data at scale: traffic verdicts, invalid clicks, account health. Today a question like "which customers spiked in invalid traffic this week?" waits for an analyst. With this pattern, CS managers and security analysts ask in plain language and get exact, checkable answers in minutes. Pointed at per-tenant data with proper permissions, the same server could also become a customer-facing "ask your traffic data" feature.
