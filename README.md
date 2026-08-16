@@ -104,9 +104,9 @@ it**, in the parser and the engine, never in a prompt.
    the response carries the file path, total rows, and a preview. Nothing is ever refused,
    trimmed, or lost — big results just arrive by file, the channel built for them.
 
-`smoke_test.py` runs a 15-attack suite against these layers (multi-statement injection,
-`COPY TO` exfiltration, reading `/etc/passwd`, re-enabling external access, extension installs,
-PRAGMA smuggling, …) and verifies known ground truth (7,043 customers, 26.54% churn rate).
+`smoke_test.py` attacks every layer (multi-statement injection, `COPY TO` exfiltration,
+filesystem reads, config re-enabling, cross-join compute bombs, path traversal) and verifies
+known ground truth (7,043 customers, 26.54% churn rate).
 
 ## Request log
 

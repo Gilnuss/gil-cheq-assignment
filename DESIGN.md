@@ -32,11 +32,11 @@ All controls sit below the model, never in a prompt:
 4. **Response routing** — like email: text inline, attachments as files. Small results return in the chat; results too large for a chat response (~50 KB threshold, configurable) are automatically delivered as a complete CSV with path + preview. Nothing is refused, trimmed, or lost.
 5. **Audit** — every call logged to a DuckDB table the LLM-facing connection cannot reach.
 
-A committed `smoke_test.py` proves it: 15 attacks (injection, exfiltration, config re-enable…) — 15/15 blocked — plus ground-truth checks (26.54% churn).
+A committed `smoke_test.py` verifies all of it: attacks blocked, ground-truth answers correct.
 
 ## Production
 
-- CSVs → the **warehouse** (Snowflake/BigQuery); local stdio → remote authenticated service (SSO).
+- CSVs + DuckDB → the **warehouse** (Snowflake/BigQuery) as the engine; same tool interface, guardrails become warehouse-native (read-only role, resource monitors). Local stdio → remote authenticated service (SSO).
 - **RLS + column masking** per authenticated user, enforced in the engine. (Absent today by design: one local analyst, no user identity.)
 - **PII** (synthetic here): hash identifiers at ingestion, mask by role, suppress small result groups (k-anonymity).
 - **Bulk export at scale**: the size budget exists because the chat channel is physically finite (a full raw dump can't fit an LLM context window regardless of policy). `export_result` already solves this locally with CSV files; production swaps the destination for S3/GCS presigned links.
