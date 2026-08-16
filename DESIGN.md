@@ -17,7 +17,7 @@ No API key: the server never calls a model — it is called *by* one.
 
 The natural questions here — rates, medians, group-bys — are **aggregations**. RAG can't count or average; SQL gives exact, checkable numbers. Also rejected: canned queries (no long tail) and the server-side `ask()` design that calls its own LLM — it hides reasoning in a black box. We follow MCP's premise: **the client brings the brain, the server brings the tools.** The user's own AI writes the SQL in the open; they see it, and can challenge it.
 
-**DuckDB over SQLite:** queries the CSVs directly (zero ETL), built for analytics, and its dialect avoids classic LLM-SQL bugs — `MEDIAN()` exists, and division isn't silently integer.
+**Why DuckDB:** it queries the committed CSVs directly (zero ETL, nothing to build), it's an engine designed for exactly this analytical workload, and its SQL dialect keeps LLM-written queries correct.
 
 ## Guardrails — the LLM is the untrusted component
 
