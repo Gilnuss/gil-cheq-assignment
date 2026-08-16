@@ -18,8 +18,6 @@ The server also sends short usage instructions to the client when it connects: r
 
 We use DuckDB as the query engine because for this dataset we mostly run aggregations (rates, group-bys, medians). DuckDB queries the CSV files directly so there is no ETL step, and it is built for exactly this kind of analytical workload. It also lets us control which queries are allowed, limit usage and avoid abuse.
 
-We chose SQL over RAG because RAG cannot count or average, and these questions need exact numbers. We also decided not to call an LLM from inside the server: the client already has a model, and keeping the generated SQL visible means answers can be verified instead of trusted.
-
 ## Guardrails
 
 The rule: the LLM is not trusted, so every control is enforced below it, never in a prompt.
@@ -29,8 +27,6 @@ The rule: the LLM is not trusted, so every control is enforced below it, never i
 3. **Compute** — queries running past 30s are cancelled (configurable). Even on small data, a cross join can create unbounded work.
 4. **Response routing** — small results return in the chat; large results are saved as a complete CSV and the chat gets the path plus a preview. Nothing is trimmed or refused.
 5. **Audit** — every call is logged to a DuckDB table that the query connection cannot touch.
-
-`smoke_test.py` checks all of this: attacks are blocked, known answers come back correct.
 
 ## Production
 
