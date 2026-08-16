@@ -61,7 +61,18 @@ r = server.run_query("SELECT 385/7043")["rows"][0][0]
 check("float division (no silent integer truncation)", 0 < r < 1, str(r))
 
 r = server.run_query("SELECT * FROM customers")
-check("row cap at 200", r["row_count"] == 200 and r["truncated"], f"{r['row_count']} rows")
+payload = len(str(r["rows"]))
+check(
+    "payload budget enforced on wide dump",
+    r["truncated"] and payload <= server.MAX_PAYLOAD_CHARS * 1.1,
+    f"{r['row_count']} rows, ~{payload // 1000} KB",
+)
+r = server.run_query('SELECT "Customer ID" FROM customers LIMIT 1500')
+check(
+    "narrow queries keep many rows within budget",
+    r["row_count"] == 1500 and not r["truncated"],
+    f"{r['row_count']} rows",
+)
 
 print("== Tool sanity ==")
 schema = server.get_schema()

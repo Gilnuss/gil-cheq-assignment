@@ -24,7 +24,13 @@ from mcp.server import MCPServer
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_GLOB = os.path.join(_BASE_DIR, "data", "*.csv")
 LOG_DB = os.path.join(_BASE_DIR, "logs", "query_log.duckdb")
-MAX_ROWS = 200          # hard cap on rows returned to the client
+
+# Cost guardrail: everything returned lands in the client LLM's context window,
+# which the user pays for per token (and re-pays on every following turn). Cap
+# the response by PAYLOAD SIZE — the actual unit of cost — not by an arbitrary
+# small row count. ~50 KB ≈ 12k tokens: cents, not dollars, per question.
+MAX_PAYLOAD_CHARS = 50_000
+HARD_MAX_ROWS = 2_000   # absolute backstop regardless of row width
 MAX_SAMPLE = 20         # cap for sample_rows
 MAX_DISTINCT = 30       # columns with more distinct values than this are not enumerated
 
@@ -158,9 +164,10 @@ def run_query(sql: str) -> dict[str, Any]:
     """Run a read-only SQL query against the `customers` table and return the
     results along with the SQL that was executed (so the answer is auditable).
 
-    Rules: exactly one statement; SELECT (or WITH ... SELECT) only; results are
-    capped at 200 rows — use aggregation instead of dumping raw rows. Call
-    get_schema first to see real column names and categorical values.
+    Rules: exactly one statement; SELECT (or WITH ... SELECT) only. Results are
+    budgeted by size (~50 KB) to protect the user's context-window cost — large
+    results are trimmed with a warning, so prefer aggregation over raw dumps.
+    Call get_schema first to see real column names and categorical values.
     """
     start = time.perf_counter()
 
@@ -188,7 +195,7 @@ def run_query(sql: str) -> dict[str, Any]:
     try:
         cursor = CON.execute(sql)
         column_names = [d[0] for d in cursor.description]
-        rows = cursor.fetchmany(MAX_ROWS + 1)
+        fetched = cursor.fetchmany(HARD_MAX_ROWS + 1)
     except duckdb.Error as e:
         # Return the engine's message verbatim — it usually names the bad
         # column/value, which lets the client self-correct and retry.
@@ -196,17 +203,30 @@ def run_query(sql: str) -> dict[str, Any]:
              duration_ms=(time.perf_counter() - start) * 1000)
         return {"error": f"Query failed: {e}", "sql": sql}
 
-    truncated = len(rows) > MAX_ROWS
-    _log("run_query", sql, "ok", rows=min(len(rows), MAX_ROWS),
+    # Keep rows until the payload budget is spent.
+    rows: list[tuple] = []
+    budget = MAX_PAYLOAD_CHARS
+    for row in fetched[:HARD_MAX_ROWS]:
+        budget -= len(str(row))
+        if budget < 0:
+            break
+        rows.append(row)
+    truncated = len(rows) < len(fetched)
+
+    _log("run_query", sql, "ok", rows=len(rows),
          duration_ms=(time.perf_counter() - start) * 1000)
     return {
         "sql": sql,
         "columns": column_names,
-        "rows": rows[:MAX_ROWS],
-        "row_count": min(len(rows), MAX_ROWS),
+        "rows": rows,
+        "row_count": len(rows),
         "truncated": truncated,
         **(
-            {"warning": f"Result truncated to {MAX_ROWS} rows — refine with aggregation or LIMIT."}
+            {
+                "warning": f"Result trimmed to {len(rows)} rows to respect the "
+                f"~{MAX_PAYLOAD_CHARS // 1000} KB response budget (context-window cost "
+                "guardrail). Use aggregation, fewer columns, or LIMIT/OFFSET to paginate."
+            }
             if truncated
             else {}
         ),

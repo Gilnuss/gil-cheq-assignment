@@ -88,8 +88,10 @@ it**, in the parser and the engine, never in a prompt.
    is served from an in-memory copy; the CSVs on disk are never opened for writing.
 2. **Query layer** — DuckDB's own parser (not regex) classifies every statement: exactly one
    statement per call, type must be SELECT; PRAGMA and CALL are rejected explicitly.
-3. **Output layer** — results capped at 200 rows with an explicit "use aggregation" warning, so
-   a runaway `SELECT *` can't flood the client's context.
+3. **Output layer (cost guardrail)** — everything returned lands in the client LLM's context
+   window, which you pay for per token. Responses are budgeted by **size** (~50 KB ≈ 12k
+   tokens) rather than an arbitrary row count: narrow results keep thousands of rows, wide
+   dumps get trimmed with an explicit warning suggesting aggregation or pagination.
 
 `smoke_test.py` runs a 15-attack suite against these layers (multi-statement injection,
 `COPY TO` exfiltration, reading `/etc/passwd`, re-enabling external access, extension installs,
