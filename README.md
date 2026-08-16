@@ -95,6 +95,21 @@ it**, in the parser and the engine, never in a prompt.
 `COPY TO` exfiltration, reading `/etc/passwd`, re-enabling external access, extension installs,
 PRAGMA smuggling, …) and verifies known ground truth (7,043 customers, 26.54% churn rate).
 
+## Request log
+
+Every tool call is appended to a DuckDB table at `logs/query_log.duckdb` (created on first
+run, gitignored): timestamp, tool, input SQL, status (`ok` / `blocked` / `error`), block
+reason or error message, rows returned, and duration. So the usage log is itself queryable
+with SQL:
+
+```bash
+.venv/bin/python -c "import duckdb; print(duckdb.connect('logs/query_log.duckdb', read_only=True).execute('SELECT ts, tool, input, status, rows_returned FROM query_log ORDER BY ts DESC LIMIT 20').fetchall())"
+```
+
+The log lives in a **separate database via a separate connection** — the guarded, LLM-facing
+connection has external access disabled and cannot read, modify, or attach it. The model can
+query the data but can never see or tamper with its own audit trail.
+
 ## Model configuration
 
 No model is configured here — the LLM is supplied by the MCP client. Tested with Claude Code

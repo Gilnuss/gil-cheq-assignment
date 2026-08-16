@@ -15,12 +15,15 @@ server's job is to make that loop accurate and safe:
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import duckdb
 from mcp.server import MCPServer
 
-DATA_GLOB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "*.csv")
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_GLOB = os.path.join(_BASE_DIR, "data", "*.csv")
+LOG_DB = os.path.join(_BASE_DIR, "logs", "query_log.duckdb")
 MAX_ROWS = 200          # hard cap on rows returned to the client
 MAX_SAMPLE = 20         # cap for sample_rows
 MAX_DISTINCT = 30       # columns with more distinct values than this are not enumerated
@@ -51,6 +54,45 @@ def _connect() -> duckdb.DuckDBPyConnection:
 
 CON = _connect()
 
+# --- Request log: an append-only DuckDB table in its own database file. -------
+# Deliberately a SEPARATE connection: the guarded, LLM-facing connection above
+# has external access disabled and its configuration locked, so no SQL arriving
+# through run_query can ever read, modify, or attach the audit log. Only this
+# code path writes to it. Never log to stdout — that carries the MCP protocol.
+os.makedirs(os.path.dirname(LOG_DB), exist_ok=True)
+_LOG_CON = duckdb.connect(LOG_DB)
+_LOG_CON.execute(
+    """
+    CREATE TABLE IF NOT EXISTS query_log (
+        ts            TIMESTAMP DEFAULT now(),
+        tool          VARCHAR NOT NULL,
+        input         VARCHAR,
+        status        VARCHAR NOT NULL,   -- 'ok' | 'blocked' | 'error'
+        detail        VARCHAR,            -- block reason / error message
+        rows_returned INTEGER,
+        duration_ms   DOUBLE
+    )
+    """
+)
+
+
+def _log(
+    tool: str,
+    input_: str | None,
+    status: str,
+    detail: str | None = None,
+    rows: int | None = None,
+    duration_ms: float | None = None,
+) -> None:
+    try:
+        _LOG_CON.execute(
+            "INSERT INTO query_log (tool, input, status, detail, rows_returned, duration_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [tool, input_, status, detail, rows, duration_ms],
+        )
+    except duckdb.Error:
+        pass  # logging must never break the actual request
+
 # Guardrail layer 2 (query validation) uses DuckDB's parser via extract_statements;
 # only these statement types are allowed through.
 _ALLOWED_STATEMENT_TYPES = {duckdb.StatementType.SELECT}
@@ -77,6 +119,7 @@ def get_schema() -> dict[str, Any]:
     ALWAYS call this before writing SQL — filter values must match the real
     values listed here (e.g. Contract = 'Month-to-Month', not 'monthly').
     """
+    _log("get_schema", None, "ok")
     columns = []
     for name, dtype in CON.execute(
         "SELECT column_name, data_type FROM information_schema.columns "
@@ -119,22 +162,28 @@ def run_query(sql: str) -> dict[str, Any]:
     capped at 200 rows — use aggregation instead of dumping raw rows. Call
     get_schema first to see real column names and categorical values.
     """
+    start = time.perf_counter()
+
+    def blocked(reason: str) -> dict[str, Any]:
+        _log("run_query", sql, "blocked", reason)
+        return {"error": reason}
+
     try:
         statements = CON.extract_statements(sql)
     except duckdb.Error as e:
-        return {"error": f"SQL parse error: {e}"}
+        return blocked(f"SQL parse error: {e}")
 
     if len(statements) != 1:
-        return {"error": "Exactly one SQL statement is allowed per call."}
+        return blocked("Exactly one SQL statement is allowed per call.")
     # Read-only PRAGMAs are internally rewritten to SELECTs by DuckDB; reject
     # them anyway so the SELECT-only guarantee is literal.
     if sql.lstrip().lstrip("(").lower().startswith("pragma"):
-        return {"error": "PRAGMA statements are not allowed. This server is read-only SELECT."}
+        return blocked("PRAGMA statements are not allowed. This server is read-only SELECT.")
     if statements[0].type not in _ALLOWED_STATEMENT_TYPES:
-        return {
-            "error": f"Only SELECT queries are allowed; got a "
+        return blocked(
+            f"Only SELECT queries are allowed; got a "
             f"{statements[0].type.name} statement. This server is read-only."
-        }
+        )
 
     try:
         cursor = CON.execute(sql)
@@ -143,9 +192,13 @@ def run_query(sql: str) -> dict[str, Any]:
     except duckdb.Error as e:
         # Return the engine's message verbatim — it usually names the bad
         # column/value, which lets the client self-correct and retry.
+        _log("run_query", sql, "error", str(e),
+             duration_ms=(time.perf_counter() - start) * 1000)
         return {"error": f"Query failed: {e}", "sql": sql}
 
     truncated = len(rows) > MAX_ROWS
+    _log("run_query", sql, "ok", rows=min(len(rows), MAX_ROWS),
+         duration_ms=(time.perf_counter() - start) * 1000)
     return {
         "sql": sql,
         "columns": column_names,
@@ -167,6 +220,8 @@ def churn_summary() -> dict[str, Any]:
     at stake. A reliable starting point for broad questions like "give me an
     overview of churn" — use run_query for anything more specific.
     """
+
+    _log("churn_summary", None, "ok")
 
     def q(sql: str) -> list[tuple]:
         return CON.execute(sql).fetchall()
@@ -213,6 +268,7 @@ def sample_rows(n: int = 5) -> dict[str, Any]:
     real records look like. For analysis use run_query with aggregation instead.
     """
     n = max(1, min(int(n), MAX_SAMPLE))
+    _log("sample_rows", f"n={n}", "ok", rows=n)
     cursor = CON.execute(f"SELECT * FROM customers USING SAMPLE {n} ROWS")
     return {
         "columns": [d[0] for d in cursor.description],
